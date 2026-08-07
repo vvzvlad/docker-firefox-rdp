@@ -1,0 +1,62 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "develop" ]
+
+# The registry push below authenticates with the GHCR_PAT org-level secret (a Gitea
+# PAT with write:package). We deliberately do not rely on the built-in GITEA_TOKEN
+# for the registry: its package scope depends on the Gitea version/config, while a
+# PAT works unconditionally.
+permissions:
+  contents: read   # checkout
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Log in to the Gitea container registry
+      uses: docker/login-action@v4
+      with:
+        registry: gitea.vvzvlad.xyz
+        # The repo belongs to an organisation, so `github.repository_owner` is the org name,
+        # not a login: docker login takes `github.actor`, the user who triggered the run.
+        # Note: GHCR_PAT must belong to (or be valid for) whoever pushes to main/develop.
+        username: ${{ github.actor }}
+        password: ${{ secrets.GHCR_PAT }}
+
+    - name: Compute image tags
+      id: tags
+      # main -> :latest + :<sha> (watchtower deploys :latest); any other branch -> :<branch-name>.
+      # Do NOT hardcode :develop in the else branch - a build from any side branch would
+      # silently overwrite the tag watchtower deploys to production from.
+      # The branch name is sanitized: anything outside [A-Za-z0-9_.-] (notably / in feat/foo) -> -
+      env:
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        if [ "$REF_NAME" = "main" ]; then
+          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:latest gitea.vvzvlad.xyz/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+        else
+          # Strip leading -/. (invalid as the first tag char) and cap at 100 chars
+          branch_tag=$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[.-]*//' | cut -c1-100)
+          # Fallback: a branch name of only ./- sanitizes to empty, which is not a valid tag
+          [ -n "$branch_tag" ] || branch_tag="build-$(printf '%.12s' "$GITHUB_SHA")"
+          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:${branch_tag}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build the Docker image
+      env:
+        TAGS: ${{ steps.tags.outputs.tags }}
+      run: |
+        tag_args=""
+        for tag in $TAGS; do tag_args="$tag_args --tag $tag"; done
+        docker build . --file Dockerfile $tag_args
+
+    - name: Push Docker images
+      env:
+        TAGS: ${{ steps.tags.outputs.tags }}
+      run: |
+        for tag in $TAGS; do docker push "$tag"; done

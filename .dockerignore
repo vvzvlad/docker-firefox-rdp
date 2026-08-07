@@ -1,0 +1,8 @@
+.git
+.github
+.gitea
+.claude
+*.md
+**/.DS_Store
+**/*.sqlite-shm
+*.code-workspace
