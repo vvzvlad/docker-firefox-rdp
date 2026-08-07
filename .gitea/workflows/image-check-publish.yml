@@ -23,7 +23,7 @@ jobs:
         registry: gitea.vvzvlad.xyz
         # The repo belongs to an organisation, so `github.repository_owner` is the org name,
         # not a login: docker login takes `github.actor`, the user who triggered the run.
-        username: ${{ github.actor }}
+        username: ${{ github.repository_owner }}
         password: ${{ secrets.GITEA_TOKEN }}
 
     - name: Compute image tags
