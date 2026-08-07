@@ -5,11 +5,12 @@ on:
   push:
     branches: [ "main", "develop" ]
 
-# Gitea 1.26 supports the `packages` scope in `permissions:`, so the built-in job token
-# is enough to push to the registry — no separate PAT secret is needed.
+# The built-in GITEA_TOKEN is NOT accepted by the container registry (verified on this
+# instance: runs #2 and #3 failed with `GET /v2/: unauthorized`, both with and without
+# `packages: write`). The registry push below authenticates with the REGISTRY_TOKEN PAT
+# instead — same as the other repos in this org.
 permissions:
-  contents: read    # checkout
-  packages: write   # push the image to the built-in Gitea container registry
+  contents: read   # checkout
 
 jobs:
   build:
@@ -24,7 +25,7 @@ jobs:
         # The repo belongs to an organisation, so `github.repository_owner` is the org name,
         # not a login: docker login takes `github.actor`, the user who triggered the run.
         username: ${{ github.repository_owner }}
-        password: ${{ secrets.GITEA_TOKEN }}
+        password: ${{ secrets.REGISTRY_TOKEN }}
 
     - name: Compute image tags
       id: tags
