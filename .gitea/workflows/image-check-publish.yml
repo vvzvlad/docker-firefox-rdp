@@ -5,12 +5,11 @@ on:
   push:
     branches: [ "main", "develop" ]
 
-# The registry push below authenticates with the GHCR_PAT org-level secret (a Gitea
-# PAT with write:package). We deliberately do not rely on the built-in GITEA_TOKEN
-# for the registry: its package scope depends on the Gitea version/config, while a
-# PAT works unconditionally.
+# Gitea 1.26 supports the `packages` scope in `permissions:`, so the built-in job token
+# is enough to push to the registry — no separate PAT secret is needed.
 permissions:
-  contents: read   # checkout
+  contents: read    # checkout
+  packages: write   # push the image to the built-in Gitea container registry
 
 jobs:
   build:
@@ -24,9 +23,8 @@ jobs:
         registry: gitea.vvzvlad.xyz
         # The repo belongs to an organisation, so `github.repository_owner` is the org name,
         # not a login: docker login takes `github.actor`, the user who triggered the run.
-        # Note: GHCR_PAT must belong to (or be valid for) whoever pushes to main/develop.
         username: ${{ github.actor }}
-        password: ${{ secrets.GHCR_PAT }}
+        password: ${{ secrets.GITEA_TOKEN }}
 
     - name: Compute image tags
       id: tags
