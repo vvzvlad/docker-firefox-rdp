@@ -1,0 +1,23 @@
+#!/bin/bash
+# Block until the X server on $DISPLAY answers, then exec the given command.
+#
+# supervisord's `priority` only orders the spawns, it does not wait for readiness: every
+# client started before Xvfb has created its socket dies with "exit status 1; not
+# expected" and has to be respawned. This wrapper turns that race into a short wait.
+set -euo pipefail
+
+DISPLAY="${DISPLAY:-:1}"
+export DISPLAY
+
+TIMEOUT="${WAIT_FOR_X_TIMEOUT:-30}"
+deadline=$((SECONDS + TIMEOUT))
+
+while ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+        echo "wait-for-x: X server on display $DISPLAY did not become available within ${TIMEOUT}s" >&2
+        exit 1
+    fi
+    sleep 0.25
+done
+
+exec "$@"

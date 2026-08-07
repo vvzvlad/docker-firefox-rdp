@@ -1,0 +1,130 @@
+#!/bin/bash
+# Launch Firefox in kiosk mode on $URL. Runs in the foreground: supervisord owns the
+# process and restarts it if it dies.
+set -euo pipefail
+
+PROFILE_NAME="main"
+FIREFOX_ROOT="${HOME:-/home/user}/.mozilla/firefox"
+PROFILES_INI="$FIREFOX_ROOT/profiles.ini"
+URL="${URL:-about:blank}"
+SCALE="${SCALE:-1}"
+
+log() { echo "[start-firefox] $*"; }
+
+if [[ "$URL" == "about:blank" ]]; then
+    log "WARNING: URL is unset (defaulting to about:blank) - set URL to the page to display"
+fi
+
+mkdir -p "$FIREFOX_ROOT"
+
+# Print the directory of every profile named $PROFILE_NAME, one per line, in profiles.ini
+# order. All of them are emitted rather than just the first because profiles.ini can list
+# several entries under the same name - a half-cleaned volume keeps entries whose directory
+# was deleted - and the caller wants whichever of them still exists on disk, not necessarily
+# the first one.
+profile_dirs() {
+    [[ -f "$PROFILES_INI" ]] || return 0
+
+    awk -v want="$PROFILE_NAME" -v root="$FIREFOX_ROOT" '
+        function flush() {
+            if (name == want && path != "")
+                print (rel == "0" ? path : root "/" path)
+        }
+        BEGIN { name = ""; path = ""; rel = "1" }
+        /^[ \t]*\[/ { flush(); name = ""; path = ""; rel = "1"; next }
+        /^[ \t]*Name[ \t]*=/       { sub(/^[^=]*=[ \t]*/, ""); name = $0; next }
+        /^[ \t]*Path[ \t]*=/       { sub(/^[^=]*=[ \t]*/, ""); path = $0; next }
+        /^[ \t]*IsRelative[ \t]*=/ { sub(/^[^=]*=[ \t]*/, ""); rel = $0; next }
+        END { flush() }
+    ' "$PROFILES_INI"
+}
+
+PROFILE_DIR=""
+PROFILE_CANDIDATES=()
+
+# Refresh PROFILE_CANDIDATES from profiles.ini and point PROFILE_DIR at the first candidate
+# that actually exists on disk, or leave it empty when none does.
+scan_profiles() {
+    local dir
+    mapfile -t PROFILE_CANDIDATES < <(profile_dirs)
+    PROFILE_DIR=""
+    for dir in "${PROFILE_CANDIDATES[@]}"; do
+        if [[ -d "$dir" ]]; then
+            PROFILE_DIR="$dir"
+            return 0
+        fi
+    done
+}
+
+scan_profiles
+
+# `firefox -P main` on a missing profile opens the interactive Profile Manager and never
+# gets to the page, so the profile has to exist before launch. Firefox picks the usual
+# random-salted directory name itself and registers it in profiles.ini.
+if [[ -z "$PROFILE_DIR" ]]; then
+    if (( ${#PROFILE_CANDIDATES[@]} == 0 )); then
+        log "profile '$PROFILE_NAME' is not listed in profiles.ini, creating it"
+    else
+        log "profile '$PROFILE_NAME' is listed in profiles.ini but none of its directories" \
+            "exist (${PROFILE_CANDIDATES[*]}), creating it"
+    fi
+
+    # Never silence this: a failure here used to be invisible, which made the "profile
+    # cannot be located" exit below impossible to diagnose from the container log.
+    create_rc=0
+    create_out="$(firefox --headless -CreateProfile "$PROFILE_NAME" 2>&1)" || create_rc=$?
+    if [[ -n "$create_out" ]]; then
+        while IFS= read -r line; do log "-CreateProfile: $line"; done <<<"$create_out"
+    fi
+    (( create_rc == 0 )) || log "WARNING: firefox -CreateProfile exited with status $create_rc"
+
+    scan_profiles
+fi
+
+# -CreateProfile refuses to add a name that profiles.ini already lists, and still exits 0,
+# so a stale entry pointing at a deleted directory cannot be repaired that way - without
+# this the script would exit 1 on every supervisord retry, forever. Re-create the directory
+# instead: an empty directory is exactly what -CreateProfile would have produced, and
+# Firefox populates it on first run.
+if [[ -z "$PROFILE_DIR" && ${#PROFILE_CANDIDATES[@]} -gt 0 ]]; then
+    PROFILE_DIR="${PROFILE_CANDIDATES[0]}"
+    log "re-creating the missing profile directory $PROFILE_DIR"
+    # mkdir's own failure has to be caught and explained. Under `set -e` it would otherwise
+    # kill the script before the FATAL below ever printed, leaving the operator with one
+    # cryptic "mkdir: cannot create directory: File exists" per supervisord retry and no hint
+    # about which file or which profiles.ini entry to look at.
+    mkdir_err=""
+    if ! mkdir_err="$(mkdir -p -- "$PROFILE_DIR" 2>&1)"; then
+        log "FATAL: cannot create the profile directory $PROFILE_DIR: ${mkdir_err:-unknown error}"
+        log "FATAL: that path is listed in $PROFILES_INI as profile '$PROFILE_NAME' but" \
+            "something else occupies it (a regular file, or a symlink pointing nowhere), or" \
+            "its parent directory is not writable by uid 1000."
+        log "FATAL: fix it on the volume - remove or rename $PROFILE_DIR, or delete its" \
+            "entry from $PROFILES_INI so a fresh profile can be created."
+        exit 1
+    fi
+fi
+
+if [[ -z "$PROFILE_DIR" || ! -d "$PROFILE_DIR" ]]; then
+    log "FATAL: could not create or locate Firefox profile '$PROFILE_NAME'"
+    exit 1
+fi
+
+log "using profile '$PROFILE_NAME' at $PROFILE_DIR"
+
+# Rewritten on every start so environment changes take effect; policies that do not depend
+# on the environment live in /etc/firefox/policies/policies.json instead.
+cat > "$PROFILE_DIR/user.js" <<EOF
+// Generated by /usr/local/bin/start-firefox on every container start - do not edit.
+user_pref("layout.css.devPixelsPerPx", "$SCALE");
+// Firefox is restarted automatically, so an unclean shutdown must not leave a
+// session-restore page in front of the dashboard.
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("full-screen-api.warning.timeout", 0);
+user_pref("app.update.auto", false);
+EOF
+
+log "opening $URL"
+exec firefox -P "$PROFILE_NAME" --kiosk "$URL"

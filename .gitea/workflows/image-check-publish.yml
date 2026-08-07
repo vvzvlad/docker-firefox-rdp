@@ -2,6 +2,7 @@ name: Docker Image CI
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches: [ "main", "develop" ]
 
@@ -18,7 +19,13 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # Pull requests only build, so a broken Dockerfile is caught before merge and no
+    # credentials are needed for the run.
     - name: Log in to the Gitea container registry
+      if: github.event_name != 'pull_request'
       uses: docker/login-action@v4
       with:
         registry: gitea.vvzvlad.xyz
@@ -28,34 +35,35 @@ jobs:
         password: ${{ secrets.REGISTRY_TOKEN }}
 
     - name: Compute image tags
-      id: tags
-      # main -> :latest + :<sha> (watchtower deploys :latest); any other branch -> :<branch-name>.
-      # Do NOT hardcode :develop in the else branch - a build from any side branch would
-      # silently overwrite the tag watchtower deploys to production from.
-      # The branch name is sanitized: anything outside [A-Za-z0-9_.-] (notably / in feat/foo) -> -
-      env:
-        REF_NAME: ${{ github.ref_name }}
-      run: |
-        if [ "$REF_NAME" = "main" ]; then
-          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:latest gitea.vvzvlad.xyz/${{ github.repository }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
-        else
-          # Strip leading -/. (invalid as the first tag char) and cap at 100 chars
-          branch_tag=$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[.-]*//' | cut -c1-100)
-          # Fallback: a branch name of only ./- sanitizes to empty, which is not a valid tag
-          [ -n "$branch_tag" ] || branch_tag="build-$(printf '%.12s' "$GITHUB_SHA")"
-          echo "tags=gitea.vvzvlad.xyz/${{ github.repository }}:${branch_tag}" >> "$GITHUB_OUTPUT"
-        fi
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: gitea.vvzvlad.xyz/${{ github.repository }}
+        # `latest` is what watchtower deploys to production, so it is pinned to the default
+        # branch explicitly rather than via {{is_default_branch}}: a build from any side
+        # branch (or a workflow_dispatch run on one) must never overwrite it. The timestamp
+        # tag is scoped the same way — it is a rollback target for what production actually
+        # runs, and on a side branch it would only be noise. `sha-<commit>` is the immutable
+        # tag every non-PR build gets, whichever branch it came from.
+        tags: |
+          type=raw,value=latest,enable=${{ github.ref_name == 'main' && github.event_name != 'pull_request' }}
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,format=long
+          type=raw,value={{date 'YYYYMMDD-HHmmss'}},enable=${{ github.ref_name == 'main' && github.event_name != 'pull_request' }}
 
-    - name: Build the Docker image
-      env:
-        TAGS: ${{ steps.tags.outputs.tags }}
-      run: |
-        tag_args=""
-        for tag in $TAGS; do tag_args="$tag_args --tag $tag"; done
-        docker build . --file Dockerfile $tag_args
-
-    - name: Push Docker images
-      env:
-        TAGS: ${{ steps.tags.outputs.tags }}
-      run: |
-        for tag in $TAGS; do docker push "$tag"; done
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile
+        # amd64 only, deliberately: this is a ~800 MB desktop image and cross-building it
+        # for arm64 under QEMU emulation takes hours. No production target needs arm64.
+        platforms: linux/amd64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        # ignore-error keeps the build green if this Gitea runner has no actions cache
+        # service — the cache is an optimisation, not a requirement.
+        cache-to: type=gha,mode=max,ignore-error=true

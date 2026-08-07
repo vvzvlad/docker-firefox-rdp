@@ -1,0 +1,14 @@
+{
+  "policies": {
+    "DisableAppUpdate": true,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisableFirefoxAccounts": true,
+    "DisablePocket": true,
+    "DisableProfileImport": true,
+    "DontCheckDefaultBrowser": true,
+    "NoDefaultBookmarks": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": ""
+  }
+}

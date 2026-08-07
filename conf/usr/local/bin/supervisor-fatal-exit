@@ -1,0 +1,72 @@
+#!/bin/bash
+# supervisord event listener: when any program reaches FATAL - it exhausted its
+# startretries and supervisord has given up on it - terminate supervisord so that Docker's
+# own restart policy recreates the whole container.
+#
+# Why not simply retry forever in place: supervisord's BACKOFF delay grows by one second per
+# retry (backoff += 1, reset only once a program has stayed up for startsecs), so a large
+# startretries turns into retry intervals of many minutes - a dashboard whose cause of
+# failure clears on day two would take that long to come back. Restarting the container puts
+# every program back on a 1-second retry interval, makes recovery deterministic instead of
+# depending on which program died, and surfaces in `docker ps` as a restart count rather
+# than hiding as FATAL inside a container that still reports "running".
+#
+# Requires a restart policy on the container (production uses `restart: unless-stopped`).
+# supervisord exits 0 on SIGTERM, so `on-failure` would NOT restart it.
+#
+# Event listener protocol: write READY, read one header line, read exactly the len: bytes of
+# payload it announces, answer "RESULT 2\nOK". stdout is that protocol channel, so every
+# human-readable line has to go to stderr - supervisord routes it to the container log.
+set -uo pipefail
+
+log() { echo "[fatal-exit] $*" >&2; }
+
+# One line per start, so that the listener's presence is visible in `docker logs` at all. It
+# is the component that handles every other component's failure, and its own failure is
+# invisible otherwise: if it exhausts its own startretries and goes FATAL, nothing is left to
+# act on FATAL events, and supervisord logs listener-state and protocol-desync problems at
+# `debug` level, which the default `info` level drops. Seeing this line once per container
+# start - and seeing it more than once - is the whole diagnosis.
+log "armed: watching PROCESS_STATE_FATAL, will SIGTERM supervisord (pid $PPID) when any" \
+    "program gives up so Docker's restart policy recreates the container"
+
+while :; do
+    printf 'READY\n'
+
+    # "ver:3.0 server:supervisor serial:5 pool:fatal-exit poolserial:1
+    #  eventname:PROCESS_STATE_FATAL len:74"
+    IFS= read -r header || exit 0
+
+    # Two known approximations, both deliberate, because both fail towards "listener does
+    # nothing" rather than towards a spurious container restart:
+    #  - `${header##*len:}` assumes len: is the LAST token of the header. supervisord always
+    #    puts it last, and for PROCESS_STATE_FATAL nothing after it could contain "len:".
+    #  - `read -N` counts CHARACTERS, supervisord's len: counts BYTES. They differ only if the
+    #    payload carries multi-byte UTF-8, and a PROCESS_STATE_FATAL payload is
+    #    "processname:... groupname:... from_state:..." over program names from this repo's
+    #    supervisord.conf, i.e. ASCII.
+    # If either assumption ever breaks, the read blocks or returns short, the RESULT handshake
+    # goes out of step and supervisord parks the listener - no FATAL is acted on, and the
+    # "armed" line above stops reappearing. Not restructured on purpose: a hand-rolled
+    # byte-exact reader in bash would be more code and more ways to be wrong.
+    len="${header##*len:}"
+    payload=""
+    if [[ "$len" =~ ^[0-9]+$ ]] && (( len > 0 )); then
+        # -N reads exactly len characters, delimiters included - the payload has no
+        # trailing newline of its own.
+        IFS= read -r -N "$len" payload || true
+    fi
+
+    printf 'RESULT 2\nOK'
+
+    # "processname:firefox groupname:firefox from_state:BACKOFF"
+    program="${payload#*processname:}"
+    program="${program%% *}"
+
+    log "program '${program:-unknown}' is FATAL: supervisord exhausted its startretries and"
+    log "will not try again. Event: ${payload:-$header}"
+    log "terminating supervisord (pid $PPID) so Docker restarts the container and every"
+    log "program gets a fresh, fast retry cycle"
+
+    kill -TERM "$PPID" || log "WARNING: could not signal supervisord (pid $PPID)"
+done
