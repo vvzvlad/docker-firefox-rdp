@@ -13,6 +13,16 @@ on:
 permissions:
   contents: read   # checkout
 
+# Two quick pushes to main start two runs that race: the older one can finish last and
+# publish its `latest` after the newer one, so watchtower would roll production back to
+# the previous commit on a perfectly green build. Serialising per ref makes the last
+# push win. Cancellation stays off on purpose — cancelling the older run would also
+# discard its `sha-<commit>` image, which is the immutable rollback target for that
+# commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -60,6 +70,10 @@ jobs:
         # amd64 only, deliberately: this is a ~800 MB desktop image and cross-building it
         # for arm64 under QEMU emulation takes hours. No production target needs arm64.
         platforms: linux/amd64
+        # Equivalent of `docker build --pull`. The runner is self-hosted with a long-lived
+        # daemon, so without this the base image is served from a local cache that can be
+        # months old and carries an unpatched system layer into every build.
+        pull: true
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
