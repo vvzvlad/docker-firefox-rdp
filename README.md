@@ -391,10 +391,10 @@ file. Use `docker logs` — it is the only diagnostic channel in this image (sup
 `logfile` is `/dev/null` and no program writes log files).
 
 `restart firefox` is safe with respect to leftover processes: `[program:firefox]` sets
-`stopasgroup`/`killasgroup` with `stopwaitsecs=5`, so the `Web Content` and `Socket Process`
-children are signalled along with the parent, and the whole group is SIGKILLed if the parent
-ignores SIGTERM. Without that, only the parent would be killed and the children would keep
-holding the profile lock — invisible to `healthcheck.sh`, which matches `comm`
+`stopasgroup`/`killasgroup` with `stopwaitsecs=5`, so the Firefox parent and its `Web Content`
+and `Socket Process` children are signalled along with the supervised `timeout` wrapper, and
+the whole group is SIGKILLed if Firefox ignores SIGTERM. Without that, only `timeout` would be
+killed and the browser would keep running and holding the profile lock — invisible to `healthcheck.sh`, which matches `comm`
 `firefox`/`firefox-bin` while the children rename themselves.
 
 5s rather than something longer because supervisord shuts its groups down **sequentially** in
