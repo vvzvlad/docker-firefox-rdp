@@ -67,6 +67,7 @@ RUN set -eux; \
         tzdata \
         x11-utils \
         x11vnc \
+        xdotool \
         xrdp \
         xvfb; \
     \

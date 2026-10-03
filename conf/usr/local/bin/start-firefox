@@ -126,5 +126,12 @@ user_pref("full-screen-api.warning.timeout", 0);
 user_pref("app.update.auto", false);
 EOF
 
+# Xvfb starts the pointer in the middle of the screen, on top of the dashboard; park it in
+# the top-left corner on every Firefox start. A failure here must not keep Firefox down.
+xdotool mousemove 0 0 || log "WARNING: could not move the pointer to 0,0"
+
 log "opening $URL"
-exec firefox -P "$PROFILE_NAME" --kiosk "$URL"
+# A dashboard tab left open for days keeps growing until the host OOM killer takes it, and the
+# screen then stays on "Your tab just crashed" (seen in production after ~8 days). So Firefox
+# lives one day: timeout sends it SIGTERM and supervisord's autorestart starts a fresh one.
+exec timeout 1d firefox -P "$PROFILE_NAME" --kiosk "$URL"
