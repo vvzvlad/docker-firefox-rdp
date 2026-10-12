@@ -29,11 +29,9 @@ RUN set -eux; \
     install -d -m 0755 /etc/apt/keyrings; \
     wget -qO /etc/apt/keyrings/packages.mozilla.org.asc \
         https://packages.mozilla.org/apt/repo-signing-key.gpg; \
-    # The whole keyring is validated, not just its first key: everything in a signed-by file
-    # is trusted by apt, so a tampered response carrying the genuine key plus an extra one
-    # would otherwise pass and make apt trust the attacker's key too. One fingerprint is
-    # collected per primary ("pub") key and the resulting set must equal exactly the one
-    # expected fingerprint - a spliced-in extra key, or none at all, fails the build.
+    # The whole keyring is validated: apt trusts every key in a signed-by file, so the set of
+    # primary-key fingerprints must equal exactly the one expected fingerprint - an extra
+    # spliced-in key, or none at all, fails the build.
     #
     # The expected fingerprint is a shell literal here and deliberately NOT an ARG:
     # --build-arg would let a build weaken its own supply-chain check.
@@ -105,10 +103,9 @@ RUN set -eux; \
     # to fire; only generate - and set permissions - when it did not, so the packaged files
     # keep their own ownership.
     #
-    # root:xrdp 0440 on the key follows the convention xrdp's own packaging uses
-    # (snakeoil is root:ssl-cert 0640) rather than root:root 0600, which only works because
-    # supervisord happens to run xrdp as root. Under any unprivileged xrdp an unreadable key
-    # makes TLS silently degrade to plain RDP - exactly the failure this change fixes.
+    # root:xrdp 0440 on the key follows xrdp's own packaging convention rather than
+    # root:root 0600: under an unprivileged xrdp an unreadable key makes TLS silently
+    # degrade to plain RDP.
     if [ ! -s /etc/xrdp/cert.pem ] || [ ! -s /etc/xrdp/key.pem ]; then \
         rm -f /etc/xrdp/cert.pem /etc/xrdp/key.pem; \
         openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \

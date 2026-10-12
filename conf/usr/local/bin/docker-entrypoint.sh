@@ -56,10 +56,8 @@ fi
 # abort with "Server is already active for display 1". Nothing else owns these paths - the
 # only X server in the container is the one supervisord is about to start.
 #
-# Not fatal: `rm -f` still returns 1 when the path cannot be unlinked at all (a read-only
-# /tmp, or /tmp/.X11-unix bind-mounted from the host), and under `set -e` that killed the
-# entrypoint before supervisord ever started. A stale lock is a maybe-problem; an entrypoint
-# that exits is a certain one, and watchtower deploys :latest unattended.
+# Not fatal: `rm -f` still fails on a read-only /tmp or a bind-mounted /tmp/.X11-unix, and
+# a stale lock is only a possible problem while an entrypoint that exits is a certain one.
 # ---------------------------------------------------------------------------
 if rm -f /tmp/.X1-lock /tmp/.X11-unix/X1; then
     log "cleared any stale X lock and socket for display :1"
@@ -70,18 +68,10 @@ else
         "the fix is to recreate the container instead of restarting it."
 fi
 
-# Same class of problem for xrdp, and /run survives `docker restart` too. Verified on this
-# image: with -nodaemon/--nodaemon neither xrdp nor xrdp-sesman ever writes a pid file, so
-# there is normally nothing here to go stale. But if one does appear - somebody debugging
-# with a plain `xrdp` inside the container, or a future config change that drops -nodaemon -
-# both refuse to start for good: they only check that the file exists, not whether the pid
-# in it is still alive ("xrdp-sesman is already running", exit 1, verified with a dead pid).
-# That would strand port 3389 permanently, and with [eventlistener:fatal-exit] in place it
-# would turn into an endless container restart loop. Nothing else in this container owns
-# these two paths, so clearing them is free insurance.
-#
-# Non-fatal for the same reason as the X paths above: free insurance must not be able to cost
-# the whole container when /run is read-only or mounted from outside.
+# Same for xrdp, and /run survives `docker restart` too. With -nodaemon neither xrdp nor
+# xrdp-sesman writes a pid file, but if one appears (e.g. a manual `xrdp` while debugging)
+# both refuse to start for good: they only check that the file exists, not that the pid is
+# alive. Nothing else owns these paths. Non-fatal for the same reason as the X paths above.
 if ! rm -f /run/xrdp/xrdp.pid /run/xrdp/xrdp-sesman.pid; then
     log "WARNING: could not clear the xrdp pid files under /run/xrdp (read-only /run?)." \
         "Startup continues; if one of them is stale, xrdp or xrdp-sesman refuses to start" \
@@ -97,16 +87,12 @@ fi
 # second Firefox next to the supervised one and deadlock on the profile lock.
 #
 # Migration is driven by a signature, not by "the file exists": an operator may legitimately
-# have put their own rc.lua in the volume, and renaming that away on every start would
-# silently discard their customisation.
+# have put their own rc.lua in the volume.
 # ---------------------------------------------------------------------------
 #
-# A failed migration is never fatal. `mv` cannot rename a path that is itself a bind mount
-# (EBUSY: `-v ./rc.lua:/home/user/.config/awesome/rc.lua` is a perfectly reasonable way to
-# ship a config), and a read-only volume fails the same way. Under `set -e` that used to kill
-# the entrypoint before supervisord ever started - a total outage caused by a config detail,
-# on hosts where watchtower deploys unattended. Returns non-zero so the caller can explain
-# what the consequence of the failure is for that particular file.
+# A failed migration is never fatal: `mv` cannot rename a bind-mounted path (EBUSY) or
+# anything on a read-only volume. Returns non-zero so the caller can explain the consequence
+# for that particular file.
 migrate_aside() {
     local path="$1" backup="$1$LEGACY_SUFFIX"
 
@@ -136,8 +122,7 @@ migrate_aside() {
 LEGACY_RC_LUA="$USER_HOME/.config/awesome/rc.lua"
 if [[ -e "$LEGACY_RC_LUA" ]]; then
     if [[ -d "$LEGACY_RC_LUA" ]]; then
-        # grep would print "Is a directory" and exit non-zero here, which used to look
-        # exactly like "no legacy launcher in it" and take the custom-rc.lua branch.
+        # grep on a directory exits non-zero, which would look like "no legacy launcher".
         log "WARNING: $LEGACY_RC_LUA is a directory, not a Lua file. awesome cannot load it" \
             "and falls back to the image's /etc/xdg/awesome/rc.lua. Nothing was migrated;" \
             "remove the directory to silence this."
@@ -183,21 +168,14 @@ fi
 
 # Rewrite `key=value` in xrdp.ini in place.
 #
-# The file is re-secured after every rewrite: `mv` of a temp file replaces the inode, so the
-# packaged permissions are gone and the default umask would leave it 0644 - world-readable.
-# That matters because [xrdp1] password= holds the VNC password in plaintext, and every
-# process in the container (Firefox under uid 1000 included) could read it. root:xrdp 0640
-# follows the package convention for xrdp's own config; xrdp and xrdp-sesman run as root
-# under supervisord, so they can read it either way.
+# The file is re-secured to root:xrdp 0640 after every rewrite: `mv` replaces the inode, and
+# [xrdp1] password= holds the VNC password in plaintext, which uid 1000 (Firefox) must not read.
 #
-# Matching is deliberately narrow (`key=` at the very start of a line), so it is counted
-# first: a key that is absent, commented out, or written as `key = value` would otherwise be
-# rewritten into nothing at all while the caller happily logged success. These variables
-# exist to recover a display that cannot connect, so a silent no-op is the worst outcome.
+# Matching is narrow (`key=` at the very start of a line), so matches are counted first: an
+# absent, commented-out or `key = value` key must be reported, not silently skipped.
 #
-# Returns non-zero when the value was NOT written, so no caller can claim otherwise. Never
-# fatal: every failure here leaves a working (if differently configured) xrdp behind, and a
-# container that starts is worth more than one that is exactly right.
+# Returns non-zero when the value was NOT written. Never fatal: every failure leaves a
+# working (if differently configured) xrdp behind.
 set_xrdp_ini() {
     local key="$1" value="$2" matches original_lines new_lines
 
@@ -217,22 +195,14 @@ set_xrdp_ini() {
 
     original_lines="$(wc -l < "$XRDP_INI")"
 
-    # umask in a subshell, because the redirection below creates the temp file with the
-    # process umask (0022 -> 0644) and it already contains the plaintext password. Without
-    # this the password is world-readable for the short window between awk writing the file
-    # and the chmod after `mv`. `mv` carries the 0600 over, so the file is never 0644.
+    # umask 0077 in a subshell: the temp file holds the plaintext password and must never be
+    # 0644, and `mv` carries the 0600 over.
     #
-    # The subshell's status is checked, and errexit cannot be relied on to do it: every caller
-    # invokes this function from an `if` condition, which suppresses errexit for the whole
-    # dynamic extent of the call. A short write - the writable layer out of space (the
-    # container log grows without bound under docker's default json-file driver), a quota, awk
-    # OOM-killed - leaves a PARTIAL config in the temp file, and `mv` is a rename within one
-    # filesystem, so it needs no space at all and would install it happily. That is the worst
-    # failure this image has: an xrdp.ini that lost its [xrdp1] section still leaves xrdp
-    # listening on 3389 (the port in the file is xrdp's own default), so every healthcheck
-    # probe passes and the container reports running + healthy while no RDP session can start -
-    # and the truncated file sits in the writable layer, surviving every `docker restart`
-    # until the container is recreated. Nothing that failed validation may reach $XRDP_INI.
+    # The subshell's status is checked explicitly: callers invoke this from an `if`, which
+    # suppresses errexit. A short write (full writable layer, quota, awk killed) would leave a
+    # partial config that `mv` installs happily; an xrdp.ini without [xrdp1] still listens on
+    # 3389, so the container looks healthy while no RDP session can start. Nothing that failed
+    # validation may reach $XRDP_INI.
     if ! (
         umask 0077
         XRDP_KEY="$key" XRDP_VALUE="$value" awk '
@@ -264,12 +234,9 @@ set_xrdp_ini() {
         return 1
     fi
 
-    # Replacing the file by rename fails with EBUSY when xrdp.ini is itself a bind mount
-    # (`-v ./xrdp.ini:/etc/xrdp/xrdp.ini`), and mv only falls back to copying across
-    # filesystems (EXDEV), not for EBUSY. Under `set -e` that killed the entrypoint before
-    # supervisord ever started - the whole dashboard down because one file was mounted. Warn
-    # and carry on instead, and take the temp file with its plaintext copy of the password
-    # away again.
+    # Replacing the file by rename fails with EBUSY when xrdp.ini is itself a bind mount (mv
+    # only falls back to copying for EXDEV). Warn and carry on, and remove the temp file with
+    # its plaintext copy of the password.
     if ! mv "$XRDP_INI.tmp" "$XRDP_INI"; then
         rm -f "$XRDP_INI.tmp"
         log "WARNING: could not replace $XRDP_INI, so '$key' was NOT applied (a file that is" \
@@ -322,22 +289,18 @@ clear_password_desync() {
 # ---------------------------------------------------------------------------
 # RDP security layer and encryption level
 #
-# `negotiate` now genuinely selects TLS (the image ships a certificate and key_file), and
-# that certificate is self-signed, so some clients - mstsc among them - show a one-time
-# "identity cannot be verified" prompt, and very old thin-client stacks may not cope with
-# crypt_level=high at all. On an unattended wall display a modal dialog is a blank screen
-# that nobody dismisses, so both settings must be switchable without rebuilding the image.
+# `negotiate` selects TLS with the image's self-signed certificate, so some clients (mstsc)
+# show an "identity cannot be verified" prompt, and old thin clients may not cope with
+# crypt_level=high. On an unattended wall display a modal dialog is a blank screen, so both
+# settings are switchable without rebuilding the image.
 # ---------------------------------------------------------------------------
 
 # Lower-case an xrdp enum variable and check it against the values xrdp accepts, leaving the
 # result in $normalised (a global, because logging from a command substitution would send the
 # warning to the caller instead of the container log).
 #
-# xrdp compares these with g_strcasecmp, so TLS and tls are the same thing to it and must be
-# to us too. An unexpected value is a loud warning and a fallback to the default, never an
-# exit: these variables get edited by hand while somebody is trying to get a dead display
-# back, and with watchtower deploying :latest unattended, an entrypoint that exits means the
-# dashboard does not come up at all. A default-secure setting beats a black screen.
+# xrdp compares these case-insensitively (g_strcasecmp). An unexpected value is a warning and
+# a fallback to the default, never an exit: a default-secure setting beats a black screen.
 normalise_choice() {
     local name="$1" raw="$2" default="$3" allowed="$4"
 
@@ -369,10 +332,8 @@ fi
 #   VNC_PASSWORD > VNC_PASSWORD_FILE > PASSWORD (deprecated)
 #                > /run/secrets/vncpasswd (legacy) > no password
 #
-# PASSWORD sits below VNC_PASSWORD_FILE, not above it: it is the deprecated spelling and must
-# not outrank the *_FILE convention that replaced it. Whichever source wins is named in the
-# log, and every lower-ranked source that was also set is reported as ignored - naming the
-# winner, so the message can never blame a variable the operator never set.
+# PASSWORD is deprecated, so it ranks below VNC_PASSWORD_FILE. The winning source is named in
+# the log, and every lower-ranked source that was also set is reported as ignored.
 # ---------------------------------------------------------------------------
 
 # Whatever a previous start of this container decided is about to be decided again from
@@ -468,13 +429,10 @@ if [[ -n "$vnc_password" ]]; then
     # What matters is that the long-running x11vnc that supervisord starts carries no
     # password in argv at all, just `-rfbauth <file>`.
     #
-    # Every step is checked explicitly instead of being left to errexit. This block used to
-    # sit in the body of an `if`, where errexit IS live, so a read-only /run or a full
-    # writable layer exited the entrypoint with no explanation at all - under a restart policy
-    # that is a permanent restart loop and a dashboard that never comes up. It also must not
-    # end with x11vnc pointed at a passwd file that does not exist or that uid 1000 cannot
-    # read: x11vnc would exit immediately, be retried until FATAL, and take the container down
-    # with it every ~21 minutes, forever.
+    # Every step is checked explicitly instead of being left to errexit: a read-only /run or a
+    # full writable layer must produce a warning, not a silent exit. x11vnc must also never be
+    # pointed at a passwd file that is missing or unreadable by uid 1000, or it exits, is
+    # retried until FATAL and takes the container down with it.
     vnc_password_stored=1
     x11vnc_passwd_dir="$(dirname "$X11VNC_PASSWD_FILE")"
     if ! install -d -m 0700 -o user -g user "$x11vnc_passwd_dir"; then
@@ -542,9 +500,8 @@ elif [[ -f "$X11VNC_SECRET_FILE" ]]; then
     # cannot read: it would exit immediately and be retried forever. Fail here instead, with
     # a message that says what to change.
     #
-    # The runuser test is guarded: without the guard a missing binary makes `if ! runuser`
-    # true (exit 127) and produces a confident FATAL about file permissions for a problem
-    # that is nothing of the sort.
+    # The runuser test is guarded: a missing binary would make `if ! runuser` true (exit 127)
+    # and produce a false FATAL about file permissions.
     if ! command -v runuser >/dev/null 2>&1; then
         log "WARNING: runuser is not installed, so it cannot be verified that" \
             "$X11VNC_SECRET_FILE is readable by uid 1000. If x11vnc keeps restarting, that" \
@@ -575,10 +532,8 @@ fi
 # per connection at its default verbosity - ~3000 lines per instance per day in the only
 # diagnostic channel this image has.
 #
-# But `-q` is not free: x11vnc routes almost everything through rfbLog, including non-fatal
-# failures like "X11 MIT Shared Memory Attach failed" / BadAccess - the exact message that
-# diagnosed the shm/uid problem this image has already had once. So the flag has to be
-# switchable at runtime, without a rebuild: `-e X11VNC_QUIET=` restores full verbosity.
+# `-q` also hides non-fatal failures such as "X11 MIT Shared Memory Attach failed", so it is
+# switchable at runtime: `-e X11VNC_QUIET=` restores full verbosity.
 #
 # Exported unconditionally (and with ${VAR-default}, not ${VAR:-default}, so that an
 # explicitly empty value survives): supervisord fails to even parse a config whose
