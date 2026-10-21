@@ -76,7 +76,7 @@ volumes:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `URL` | `about:blank` | page opened in Firefox kiosk mode; a warning is logged if left at the default |
+| `URL` | `about:blank` | page opened in Firefox kiosk mode; a warning is logged if left at the default. For an `http(s)` URL Firefox starts only once the server answers it successfully (checked every 5 s), so a dashboard whose server comes up after the container is not left on an error page |
 | `RESOLUTION` | `1366x768x24` | Xvfb screen geometry and colour depth |
 | `SCALE` | `1` | UI scale factor (Firefox `layout.css.devPixelsPerPx`), e.g. `0.8` to fit more on screen |
 | `TZ` | (unset) | container time zone, e.g. `Europe/Moscow` |
@@ -333,7 +333,7 @@ or stay on the new image.
 `/usr/local/bin/healthcheck.sh` fails unless all five hold:
 
 1. X answers on `:1`,
-2. a Firefox process is alive,
+2. a Firefox process is alive (so the check fails while Firefox is still waiting for `$URL` to answer),
 3. TCP 3389 (xrdp) accepts a connection,
 4. x11vnc on 5900 answers with the `RFB` protocol banner,
 5. `/run/xrdp-password-desync` does not exist.

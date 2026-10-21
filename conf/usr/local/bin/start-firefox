@@ -130,6 +130,20 @@ EOF
 # the top-left corner on every Firefox start. A failure here must not keep Firefox down.
 xdotool mousemove 0 0 || log "WARNING: could not move the pointer to 0,0"
 
+# After a host reboot the page's server often comes up after this container. A page that
+# failed to load stays on Firefox's error screen for good - a dashboard's own auto-refresh is
+# part of the page that never loaded - so Firefox starts only once the server answers $URL
+# successfully.
+if [[ "$URL" == http://* || "$URL" == https://* ]]; then
+    waited=0
+    until wget -q -O /dev/null --timeout=5 --tries=1 "$URL"; do
+        rc=$?
+        (( waited % 60 == 0 )) && log "waiting for $URL to answer (wget exit $rc: 4 network, 5 TLS, 8 HTTP error)"
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+fi
+
 log "opening $URL"
 # A dashboard tab left open for days keeps growing until the host OOM killer takes it, and the
 # screen then stays on "Your tab just crashed" (seen in production after ~8 days). So Firefox
